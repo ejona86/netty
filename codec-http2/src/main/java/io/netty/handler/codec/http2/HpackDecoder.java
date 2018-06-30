@@ -53,24 +53,12 @@ final class HpackDecoder {
             connectionError(COMPRESSION_ERROR, "HPACK - illegal index value"), HpackDecoder.class, "decode(..)");
     private static final Http2Exception INDEX_HEADER_ILLEGAL_INDEX_VALUE = unknownStackTrace(
             connectionError(COMPRESSION_ERROR, "HPACK - illegal index value"), HpackDecoder.class, "indexHeader(..)");
-    private static final Http2Exception READ_NAME_ILLEGAL_INDEX_VALUE = unknownStackTrace(
-            connectionError(COMPRESSION_ERROR, "HPACK - illegal index value"), HpackDecoder.class, "readName(..)");
     private static final Http2Exception INVALID_MAX_DYNAMIC_TABLE_SIZE = unknownStackTrace(
             connectionError(COMPRESSION_ERROR, "HPACK - invalid max dynamic table size"), HpackDecoder.class,
             "setDynamicTableSize(..)");
     private static final Http2Exception MAX_DYNAMIC_TABLE_SIZE_CHANGE_REQUIRED = unknownStackTrace(
             connectionError(COMPRESSION_ERROR, "HPACK - max dynamic table size change required"), HpackDecoder.class,
             "decode(..)");
-    private static final byte READ_HEADER_REPRESENTATION = 0;
-    private static final byte READ_MAX_DYNAMIC_TABLE_SIZE = 1;
-    private static final byte READ_INDEXED_HEADER = 2;
-    private static final byte READ_INDEXED_HEADER_NAME = 3;
-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH_PREFIX = 4;
-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH = 5;
-    private static final byte READ_LITERAL_HEADER_NAME = 6;
-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX = 7;
-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 8;
-    private static final byte READ_LITERAL_HEADER_VALUE = 9;
 
     private final HpackDynamicTable hpackDynamicTable;
     private final HpackHuffmanDecoder hpackHuffmanDecoder;
@@ -78,19 +66,8 @@ final class HpackDecoder {
     private long encoderMaxDynamicTableSize;
     private boolean maxDynamicTableSizeChangeRequired;
 
-    private byte state = READ_HEADER_REPRESENTATION;
-    private int index;
-    private int nameLength;
-    private int valueLength;
-    private boolean huffmanEncoded;
-    private IndexType indexType = IndexType.NONE;
-    private CharSequence name;
-    /**
-     * An entry is ignored if it is too large for both the dynamic table and the output header
-     * list. When true, we still process the entry, but by throwing it away and clearing then
-     * dynamic table if the entry would have been added to the table.
-     */
-    private boolean ignoreEntry;
+    private int waitingForLength;
+    private int ignoreLength;
 
     /**
      * Create a new instance.
@@ -118,232 +95,201 @@ final class HpackDecoder {
      * Must call {@link #checkDecodeComplete()} after the entire header block has been provided.
      */
     public void decode(ByteBuf in, Sink sink) throws Http2Exception {
-        while (in.isReadable()) {
-            switch (state) {
-                case READ_HEADER_REPRESENTATION:
-                    assert !ignoreEntry;
-                    byte b = in.readByte();
-                    if (maxDynamicTableSizeChangeRequired && (b & 0xE0) != 0x20) {
-                        // HpackEncoder MUST signal maximum dynamic table size change
-                        throw MAX_DYNAMIC_TABLE_SIZE_CHANGE_REQUIRED;
-                    }
-                    if (b < 0) {
-                        // Indexed Header Field
-                        index = b & 0x7F;
-                        switch (index) {
-                            case 0:
-                                throw DECODE_ILLEGAL_INDEX_VALUE;
-                            case 0x7F:
-                                state = READ_INDEXED_HEADER;
-                                break;
-                            default:
-                                HpackHeaderField indexedHeader = getIndexedHeader(index);
-                                sink.appendToHeaderList(indexedHeader.name, indexedHeader.value);
-                        }
-                    } else if ((b & 0x40) == 0x40) {
-                        // Literal Header Field with Incremental Indexing
-                        indexType = IndexType.INCREMENTAL;
-                        index = b & 0x3F;
-                        switch (index) {
-                            case 0:
-                                state = READ_LITERAL_HEADER_NAME_LENGTH_PREFIX;
-                                break;
-                            case 0x3F:
-                                state = READ_INDEXED_HEADER_NAME;
-                                break;
-                            default:
-                                // Index was stored as the prefix
-                                name = readName(index);
-                                nameLength = name.length();
-                                state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                        }
-                    } else if ((b & 0x20) == 0x20) {
-                        // Dynamic Table Size Update
-                        index = b & 0x1F;
-                        if (index == 0x1F) {
-                            state = READ_MAX_DYNAMIC_TABLE_SIZE;
-                        } else {
-                            setDynamicTableSize(index);
-                            state = READ_HEADER_REPRESENTATION;
-                        }
-                    } else {
-                        // Literal Header Field without Indexing / never Indexed
-                        indexType = ((b & 0x10) == 0x10) ? IndexType.NEVER : IndexType.NONE;
-                        index = b & 0x0F;
-                        switch (index) {
-                            case 0:
-                                state = READ_LITERAL_HEADER_NAME_LENGTH_PREFIX;
-                                break;
-                            case 0x0F:
-                                state = READ_INDEXED_HEADER_NAME;
-                                break;
-                            default:
-                                // Index was stored as the prefix
-                                name = readName(index);
-                                nameLength = name.length();
-                                state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                        }
-                    }
-                    break;
-
-                case READ_MAX_DYNAMIC_TABLE_SIZE:
-                {
-                    long dynamicTableSize = decodeULE128(in, (long) index);
-                    if (dynamicTableSize == -1) {
-                        // Need more data
-                        return;
-                    }
-                    setDynamicTableSize(dynamicTableSize);
-                    state = READ_HEADER_REPRESENTATION;
-                    break;
-                }
-
-                case READ_INDEXED_HEADER:
-                {
-                    int decodedIndex = decodeULE128(in, index);
-                    if (decodedIndex == -1) {
-                        // Need more data
-                        return;
-                    }
-                    HpackHeaderField indexedHeader = getIndexedHeader(decodedIndex);
-                    sink.appendToHeaderList(indexedHeader.name, indexedHeader.value);
-                    state = READ_HEADER_REPRESENTATION;
-                    break;
-                }
-
-                case READ_INDEXED_HEADER_NAME:
-                    // Header Name matches an entry in the Header Table
-                    nameLength = decodeULE128(in, index);
-                    if (nameLength == -1) {
-                        // Need more data
-                        return;
-                    }
-                    name = readName(nameLength);
-                    state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                    break;
-
-                case READ_LITERAL_HEADER_NAME_LENGTH_PREFIX:
-                    b = in.readByte();
-                    huffmanEncoded = (b & 0x80) == 0x80;
-                    index = b & 0x7F;
-                    if (index == 0x7f) {
-                        state = READ_LITERAL_HEADER_NAME_LENGTH;
-                    } else {
-                        nameLength = index;
-                        state = READ_LITERAL_HEADER_NAME;
-                    }
-                    break;
-
-                case READ_LITERAL_HEADER_NAME_LENGTH:
-                    // Header Name is a Literal String
-                    nameLength = decodeULE128(in, index);
-                    if (nameLength == -1) {
-                        // Need more data
-                        return;
-                    }
-
-                    state = READ_LITERAL_HEADER_NAME;
-                    break;
-
-                case READ_LITERAL_HEADER_NAME:
-                    if (nameLength > encoderMaxDynamicTableSize && sink.triggersExceededSizeLimit(nameLength)) {
-                        ignoreEntry = true;
-                    }
-                    // Wait until entire name is readable
-                    if (in.readableBytes() < nameLength) {
-                        if (ignoreEntry) {
-                            int readableBytes = in.readableBytes();
-                            in.skipBytes(readableBytes);
-                            valueLength -= readableBytes;
-                        }
-                        return;
-                    }
-
-                    if (ignoreEntry) {
-                        in.skipBytes(nameLength);
-                        name = EMPTY_STRING;
-                    } else {
-                        name = readStringLiteral(in, nameLength, huffmanEncoded);
-                    }
-
-                    state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                    break;
-
-                case READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX:
-                    b = in.readByte();
-                    huffmanEncoded = (b & 0x80) == 0x80;
-                    index = b & 0x7F;
-                    switch (index) {
-                        case 0x7f:
-                            state = READ_LITERAL_HEADER_VALUE_LENGTH;
-                            break;
-                        case 0:
-                            if (ignoreEntry) {
-                                ignoreEntry = false;
-                                if (indexType == IndexType.INCREMENTAL) {
-                                    hpackDynamicTable.clear();
-                                }
-                            } else {
-                                insertHeader(sink, name, EMPTY_STRING, indexType);
-                            }
-                            name = null;
-                            state = READ_HEADER_REPRESENTATION;
-                            break;
-                        default:
-                            valueLength = index;
-                            state = READ_LITERAL_HEADER_VALUE;
-                    }
-
-                    break;
-
-                case READ_LITERAL_HEADER_VALUE_LENGTH:
-                    // Header Value is a Literal String
-                    valueLength = decodeULE128(in, index);
-                    if (nameLength == -1) {
-                        // Need more data
-                        return;
-                    }
-
-                    state = READ_LITERAL_HEADER_VALUE;
-                    break;
-
-                case READ_LITERAL_HEADER_VALUE:
-                    if (valueLength > encoderMaxDynamicTableSize
-                            && sink.triggersExceededSizeLimit(nameLength + valueLength)) {
-                        ignoreEntry = true;
-                    }
-                    // Wait until entire value is readable
-                    if (in.readableBytes() < valueLength) {
-                        if (ignoreEntry) {
-                            int readableBytes = in.readableBytes();
-                            in.skipBytes(readableBytes);
-                            valueLength -= readableBytes;
-                        }
-                        return;
-                    }
-
-                    if (ignoreEntry) {
-                        ignoreEntry = false;
-                        in.skipBytes(valueLength);
-                        if (indexType == IndexType.INCREMENTAL) {
-                            hpackDynamicTable.clear();
-                        }
-                    } else {
-                        CharSequence value = readStringLiteral(in, valueLength, huffmanEncoded);
-                        insertHeader(sink, name, value, indexType);
-                    }
-                    name = null;
-                    state = READ_HEADER_REPRESENTATION;
-                    break;
-
-                default:
-                    throw new Error("should not reach here state: " + state);
+        if (waitingForLength > 0) {
+            if (waitingForLength > in.readableBytes()) {
+                return;
             }
+            waitingForLength = 0;
+        }
+        if (ignoreLength > 0) {
+            int skipLength = Math.min(ignoreLength, in.readableBytes());
+            in.skipBytes(skipLength);
+            ignoreLength -= skipLength;
+            if (ignoreLength > 0) {
+                return;
+            }
+        }
+        while (in.isReadable()) {
+            // When returning early, the readerIndex should be set back to initialReaderIndex. No allocations should be
+            // performed until the end.
+
+            int initialReaderIndex = in.readerIndex();
+            byte b = in.readByte();
+            if (maxDynamicTableSizeChangeRequired && (b & 0xE0) != 0x20) {
+                // HpackEncoder MUST signal maximum dynamic table size change
+                throw MAX_DYNAMIC_TABLE_SIZE_CHANGE_REQUIRED;
+            }
+            IndexType indexType;
+            CharSequence name;
+            // This set of ifs must either 1) finish processing and 'continue' or 2) set indexType and name. If name is
+            // set to null, it means the name is varint-prefixed and still needs to be decoded.
+            if (b < 0) {
+                // Indexed Header Field
+                int index = b & 0x7F;
+                switch (index) {
+                    case 0:
+                        throw DECODE_ILLEGAL_INDEX_VALUE;
+                    case 0x7F:
+                        index = decodeULE128(in, index);
+                        if (index == -1) {
+                            in.readerIndex(initialReaderIndex);
+                            return;
+                        }
+                    default:
+                }
+                HpackHeaderField indexedHeader = getIndexedHeader(index);
+                sink.appendToHeaderList(indexedHeader.name, indexedHeader.value);
+                continue;
+            } else if ((b & 0x40) == 0x40) {
+                // Literal Header Field with Incremental Indexing
+                indexType = IndexType.INCREMENTAL;
+                int index = b & 0x3F;
+                switch (index) {
+                    case 0:
+                        name = null;
+                        break;
+                    case 0x3F:
+                        index = decodeULE128(in, index);
+                        if (index == -1) {
+                            in.readerIndex(initialReaderIndex);
+                            return;
+                        }
+                        name = getIndexedHeader(index).name;
+                        break;
+                    default:
+                        // Index was stored as the prefix
+                        name = getIndexedHeader(index).name;
+                }
+            } else if ((b & 0x20) == 0x20) {
+                // Dynamic Table Size Update
+                long size = b & 0x1F;
+                if (size == 0x1F) {
+                    size = decodeULE128(in, size);
+                    if (size == -1) {
+                        in.readerIndex(initialReaderIndex);
+                        return;
+                    }
+                }
+                setDynamicTableSize(size);
+                continue;
+            } else {
+                // Literal Header Field without Indexing / never Indexed
+                indexType = ((b & 0x10) == 0x10) ? IndexType.NEVER : IndexType.NONE;
+                int index = b & 0x0F;
+                switch (index) {
+                    case 0:
+                        name = null;
+                        break;
+                    case 0x0F:
+                        index = decodeULE128(in, index);
+                        if (index == -1) {
+                            in.readerIndex(initialReaderIndex);
+                            return;
+                        }
+                        name = getIndexedHeader(index).name;
+                        break;
+                    default:
+                        // Index was stored as the prefix
+                        name = getIndexedHeader(index).name;
+                }
+            }
+
+            boolean nameHuffmanEncoded = false;
+            int nameStartIndex = -1;
+            int nameLength = -1;
+            if (name == null) {
+                // Read literal header name prefix
+                if (!in.isReadable()) {
+                    in.readerIndex(initialReaderIndex);
+                    return;
+                }
+                b = in.readByte();
+                nameHuffmanEncoded = (b & 0x80) == 0x80;
+                nameLength = b & 0x7F;
+                if (nameLength == 0x7f) {
+                    // Read literal header name length
+                    nameLength = decodeULE128(in, nameLength);
+                    if (nameLength == -1) {
+                        in.readerIndex(initialReaderIndex);
+                        return;
+                    }
+                }
+                // Read literal header name
+                // 128 provides a lower bound on what we'll accept when the header list size limit has been exceeded,
+                // which should virtually never matter since encoderMaxDynamicTableSize is generally multiple KB.
+                if (nameLength > encoderMaxDynamicTableSize && sink.triggersExceededSizeLimit(nameLength)
+                        && nameLength > 128) {
+                    throw new RuntimeException(); // TODO: fail connection
+                }
+                if (nameLength > in.readableBytes()) {
+                    this.waitingForLength = in.readerIndex() - initialReaderIndex + nameLength;
+                    in.readerIndex(initialReaderIndex);
+                    return;
+                }
+                nameStartIndex = in.readerIndex();
+                // Skip over the bytes for now; we'll come back to them once the full header is decoded
+                in.skipBytes(nameLength);
+            }
+
+            CharSequence value;
+            if (true) { // why is "avoid nested blocks" part of the style?
+                // Read literal header value prefix
+                if (!in.isReadable()) {
+                    in.readerIndex(initialReaderIndex);
+                    return;
+                }
+                b = in.readByte();
+                boolean valueHuffmanEncoded = (b & 0x80) == 0x80;
+                int valueLength = b & 0x7F;
+                if (valueLength == 0x7f) {
+                    // Read literal header value length
+                    valueLength = decodeULE128(in, valueLength);
+                    if (valueLength == -1) {
+                        in.readerIndex(initialReaderIndex);
+                        return;
+                    }
+                }
+                // Read literal header value
+                int totalLength = nameLength + valueLength;
+                if (totalLength > encoderMaxDynamicTableSize && sink.triggersExceededSizeLimit(totalLength)) {
+                    // Ignore this entry
+                    if (indexType == IndexType.INCREMENTAL) {
+                        hpackDynamicTable.clear();
+                    }
+                    int skipLength = Math.min(valueLength, in.readableBytes());
+                    in.skipBytes(skipLength);
+                    valueLength -= skipLength;
+                    if (valueLength > 0) {
+                        this.ignoreLength = valueLength;
+                        in.readerIndex(initialReaderIndex);
+                        return;
+                    }
+                }
+                if (valueLength > in.readableBytes()) {
+                    this.waitingForLength = in.readerIndex() - initialReaderIndex + valueLength;
+                    in.readerIndex(initialReaderIndex);
+                    return;
+                }
+
+                // THIS HEADER IS COMPLETE; do final processing
+
+                value = readStringLiteral(in, valueLength, valueHuffmanEncoded);
+            }
+
+            if (name == null) {
+                int savedReaderIndex = in.readerIndex();
+                in.readerIndex(nameStartIndex);
+                name = readStringLiteral(in, nameLength, nameHuffmanEncoded);
+                in.readerIndex(savedReaderIndex);
+            }
+
+            insertHeader(sink, name, value, indexType);
         }
     }
 
-    public void checkDecodeComplete() throws Http2Exception {
-        if (state != READ_HEADER_REPRESENTATION) {
+    public void checkDecodeComplete(ByteBuf in) throws Http2Exception {
+        boolean complete = ignoreLength == 0 && !in.isReadable();
+        if (!complete) {
             throw connectionError(COMPRESSION_ERROR, "Incomplete header block fragment.");
         }
     }
@@ -402,18 +348,6 @@ final class HpackDecoder {
         encoderMaxDynamicTableSize = dynamicTableSize;
         maxDynamicTableSizeChangeRequired = false;
         hpackDynamicTable.setCapacity(dynamicTableSize);
-    }
-
-    private CharSequence readName(int index) throws Http2Exception {
-        if (index <= HpackStaticTable.length) {
-            HpackHeaderField hpackHeaderField = HpackStaticTable.getEntry(index);
-            return hpackHeaderField.name;
-        }
-        if (index - HpackStaticTable.length <= hpackDynamicTable.length()) {
-            HpackHeaderField hpackHeaderField = hpackDynamicTable.getEntry(index - HpackStaticTable.length);
-            return hpackHeaderField.name;
-        }
-        throw READ_NAME_ILLEGAL_INDEX_VALUE;
     }
 
     private HpackHeaderField getIndexedHeader(int index) throws Http2Exception {

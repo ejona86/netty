@@ -150,7 +150,7 @@ public class DefaultHttp2HeadersDecoder implements Http2HeadersDecoder, Http2Hea
         if (!endHeaders) {
             return null;
         }
-        hpackDecoder.checkDecodeComplete();
+        hpackDecoder.checkDecodeComplete(headerBlock);
         // we have read all of our headers. See if we have exceeded our maxHeaderListSize. We must
         // delay throwing until this point to prevent dynamic table corruption
         sink.checkExceededMaxLength();
