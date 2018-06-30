@@ -63,24 +63,15 @@ final class HpackDecoder {
             connectionError(COMPRESSION_ERROR, "HPACK - illegal index value"), HpackDecoder.class, "decode(..)");
     private static final Http2Exception INDEX_HEADER_ILLEGAL_INDEX_VALUE = unknownStackTrace(
             connectionError(COMPRESSION_ERROR, "HPACK - illegal index value"), HpackDecoder.class, "indexHeader(..)");
-    private static final Http2Exception READ_NAME_ILLEGAL_INDEX_VALUE = unknownStackTrace(
-            connectionError(COMPRESSION_ERROR, "HPACK - illegal index value"), HpackDecoder.class, "readName(..)");
     private static final Http2Exception INVALID_MAX_DYNAMIC_TABLE_SIZE = unknownStackTrace(
             connectionError(COMPRESSION_ERROR, "HPACK - invalid max dynamic table size"), HpackDecoder.class,
             "setDynamicTableSize(..)");
     private static final Http2Exception MAX_DYNAMIC_TABLE_SIZE_CHANGE_REQUIRED = unknownStackTrace(
             connectionError(COMPRESSION_ERROR, "HPACK - max dynamic table size change required"), HpackDecoder.class,
             "decode(..)");
-    private static final byte READ_HEADER_REPRESENTATION = 0;
-    private static final byte READ_MAX_DYNAMIC_TABLE_SIZE = 1;
-    private static final byte READ_INDEXED_HEADER = 2;
-    private static final byte READ_INDEXED_HEADER_NAME = 3;
-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH_PREFIX = 4;
-    private static final byte READ_LITERAL_HEADER_NAME_LENGTH = 5;
-    private static final byte READ_LITERAL_HEADER_NAME = 6;
-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX = 7;
-    private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 8;
-    private static final byte READ_LITERAL_HEADER_VALUE = 9;
+    private static final Http2Exception READ_LENGTH_PREFIXED_STRING_INCOMPLETE = unknownStackTrace(
+            connectionError(COMPRESSION_ERROR, "HPACK - decompression failure"), HpackDecoder.class,
+            "readLengthPrefixedString(..)");
 
     private final HpackDynamicTable hpackDynamicTable;
     private final HpackHuffmanDecoder hpackHuffmanDecoder;
@@ -129,173 +120,76 @@ final class HpackDecoder {
     }
 
     private void decode(ByteBuf in, Sink sink) throws Http2Exception {
-        int index = 0;
-        int nameLength = 0;
-        int valueLength = 0;
-        byte state = READ_HEADER_REPRESENTATION;
-        boolean huffmanEncoded = false;
-        CharSequence name = null;
-        IndexType indexType = IndexType.NONE;
         while (in.isReadable()) {
-            switch (state) {
-                case READ_HEADER_REPRESENTATION:
-                    byte b = in.readByte();
-                    if (maxDynamicTableSizeChangeRequired && (b & 0xE0) != 0x20) {
-                        // HpackEncoder MUST signal maximum dynamic table size change
-                        throw MAX_DYNAMIC_TABLE_SIZE_CHANGE_REQUIRED;
-                    }
-                    if (b < 0) {
-                        // Indexed Header Field
-                        index = b & 0x7F;
-                        switch (index) {
-                            case 0:
-                                throw DECODE_ILLEGAL_INDEX_VALUE;
-                            case 0x7F:
-                                state = READ_INDEXED_HEADER;
-                                break;
-                            default:
-                                HpackHeaderField indexedHeader = getIndexedHeader(index);
-                                sink.appendToHeaderList(indexedHeader.name, indexedHeader.value);
-                        }
-                    } else if ((b & 0x40) == 0x40) {
-                        // Literal Header Field with Incremental Indexing
-                        indexType = IndexType.INCREMENTAL;
-                        index = b & 0x3F;
-                        switch (index) {
-                            case 0:
-                                state = READ_LITERAL_HEADER_NAME_LENGTH_PREFIX;
-                                break;
-                            case 0x3F:
-                                state = READ_INDEXED_HEADER_NAME;
-                                break;
-                            default:
-                                // Index was stored as the prefix
-                                name = readName(index);
-                                nameLength = name.length();
-                                state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                        }
-                    } else if ((b & 0x20) == 0x20) {
-                        // Dynamic Table Size Update
-                        index = b & 0x1F;
-                        if (index == 0x1F) {
-                            state = READ_MAX_DYNAMIC_TABLE_SIZE;
-                        } else {
-                            setDynamicTableSize(index);
-                            state = READ_HEADER_REPRESENTATION;
-                        }
-                    } else {
-                        // Literal Header Field without Indexing / never Indexed
-                        indexType = ((b & 0x10) == 0x10) ? IndexType.NEVER : IndexType.NONE;
-                        index = b & 0x0F;
-                        switch (index) {
-                            case 0:
-                                state = READ_LITERAL_HEADER_NAME_LENGTH_PREFIX;
-                                break;
-                            case 0x0F:
-                                state = READ_INDEXED_HEADER_NAME;
-                                break;
-                            default:
-                                // Index was stored as the prefix
-                                name = readName(index);
-                                nameLength = name.length();
-                                state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                        }
-                    }
-                    break;
-
-                case READ_MAX_DYNAMIC_TABLE_SIZE:
-                    setDynamicTableSize(decodeULE128(in, (long) index));
-                    state = READ_HEADER_REPRESENTATION;
-                    break;
-
-                case READ_INDEXED_HEADER:
-                    HpackHeaderField indexedHeader = getIndexedHeader(decodeULE128(in, index));
-                    sink.appendToHeaderList(indexedHeader.name, indexedHeader.value);
-                    state = READ_HEADER_REPRESENTATION;
-                    break;
-
-                case READ_INDEXED_HEADER_NAME:
-                    // Header Name matches an entry in the Header Table
-                    name = readName(decodeULE128(in, index));
-                    nameLength = name.length();
-                    state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                    break;
-
-                case READ_LITERAL_HEADER_NAME_LENGTH_PREFIX:
-                    b = in.readByte();
-                    huffmanEncoded = (b & 0x80) == 0x80;
-                    index = b & 0x7F;
-                    if (index == 0x7f) {
-                        state = READ_LITERAL_HEADER_NAME_LENGTH;
-                    } else {
-                        nameLength = index;
-                        state = READ_LITERAL_HEADER_NAME;
-                    }
-                    break;
-
-                case READ_LITERAL_HEADER_NAME_LENGTH:
-                    // Header Name is a Literal String
-                    nameLength = decodeULE128(in, index);
-
-                    state = READ_LITERAL_HEADER_NAME;
-                    break;
-
-                case READ_LITERAL_HEADER_NAME:
-                    // Wait until entire name is readable
-                    if (in.readableBytes() < nameLength) {
-                        throw notEnoughDataException(in);
-                    }
-
-                    name = readStringLiteral(in, nameLength, huffmanEncoded);
-
-                    state = READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX;
-                    break;
-
-                case READ_LITERAL_HEADER_VALUE_LENGTH_PREFIX:
-                    b = in.readByte();
-                    huffmanEncoded = (b & 0x80) == 0x80;
-                    index = b & 0x7F;
-                    switch (index) {
-                        case 0x7f:
-                            state = READ_LITERAL_HEADER_VALUE_LENGTH;
-                            break;
-                        case 0:
-                            insertHeader(sink, name, EMPTY_STRING, indexType);
-                            state = READ_HEADER_REPRESENTATION;
-                            break;
-                        default:
-                            valueLength = index;
-                            state = READ_LITERAL_HEADER_VALUE;
-                    }
-
-                    break;
-
-                case READ_LITERAL_HEADER_VALUE_LENGTH:
-                    // Header Value is a Literal String
-                    valueLength = decodeULE128(in, index);
-
-                    state = READ_LITERAL_HEADER_VALUE;
-                    break;
-
-                case READ_LITERAL_HEADER_VALUE:
-                    // Wait until entire value is readable
-                    if (in.readableBytes() < valueLength) {
-                        throw notEnoughDataException(in);
-                    }
-
-                    CharSequence value = readStringLiteral(in, valueLength, huffmanEncoded);
-                    insertHeader(sink, name, value, indexType);
-                    state = READ_HEADER_REPRESENTATION;
-                    break;
-
-                default:
-                    throw new Error("should not reach here state: " + state);
+            byte b = in.readByte();
+            if (maxDynamicTableSizeChangeRequired && (b & 0xE0) != 0x20) {
+                // HpackEncoder MUST signal maximum dynamic table size change
+                throw MAX_DYNAMIC_TABLE_SIZE_CHANGE_REQUIRED;
             }
+            IndexType indexType;
+            CharSequence name;
+            // This set of ifs must either 1) finish processing and 'continue' or 2) set indexType and name.
+            if (b < 0) {
+                // Indexed Header Field
+                int index = b & 0x7F;
+                switch (index) {
+                    case 0:
+                        throw DECODE_ILLEGAL_INDEX_VALUE;
+                    case 0x7F:
+                        index = decodeULE128(in, index);
+                        break;
+                    default:
+                }
+                HpackHeaderField indexedHeader = getIndexedHeader(index);
+                sink.appendToHeaderList(indexedHeader.name, indexedHeader.value);
+                continue;
+            } else if ((b & 0x40) == 0x40) {
+                // Literal Header Field with Incremental Indexing
+                indexType = IndexType.INCREMENTAL;
+                int index = b & 0x3F;
+                switch (index) {
+                    case 0:
+                        name = readLengthPrefixedString(in);
+                        break;
+                    case 0x3F:
+                        index = decodeULE128(in, index);
+                        name = getIndexedHeader(index).name;
+                        break;
+                    default:
+                        // Index was stored as the prefix
+                        name = getIndexedHeader(index).name;
+                }
+            } else if ((b & 0x20) == 0x20) {
+                // Dynamic Table Size Update
+                long size = b & 0x1F;
+                if (size == 0x1F) {
+                    size = decodeULE128(in, size);
+                }
+                setDynamicTableSize(size);
+                continue;
+            } else {
+                // Literal Header Field without Indexing / never Indexed
+                indexType = ((b & 0x10) == 0x10) ? IndexType.NEVER : IndexType.NONE;
+                int index = b & 0x0F;
+                switch (index) {
+                    case 0:
+                        name = readLengthPrefixedString(in);
+                        break;
+                    case 0x0F:
+                        index = decodeULE128(in, index);
+                        name = getIndexedHeader(index).name;
+                        break;
+                    default:
+                        // Index was stored as the prefix
+                        name = getIndexedHeader(index).name;
+                }
+            }
+
+            CharSequence value = readLengthPrefixedString(in);
+            insertHeader(sink, name, value, indexType);
         }
 
-        if (state != READ_HEADER_REPRESENTATION) {
-            throw connectionError(COMPRESSION_ERROR, "Incomplete header block fragment.");
-        }
+        assert !in.isReadable();
     }
 
     /**
@@ -400,18 +294,6 @@ final class HpackDecoder {
         return HeaderType.REGULAR_HEADER;
     }
 
-    private CharSequence readName(int index) throws Http2Exception {
-        if (index <= HpackStaticTable.length) {
-            HpackHeaderField hpackHeaderField = HpackStaticTable.getEntry(index);
-            return hpackHeaderField.name;
-        }
-        if (index - HpackStaticTable.length <= hpackDynamicTable.length()) {
-            HpackHeaderField hpackHeaderField = hpackDynamicTable.getEntry(index - HpackStaticTable.length);
-            return hpackHeaderField.name;
-        }
-        throw READ_NAME_ILLEGAL_INDEX_VALUE;
-    }
-
     private HpackHeaderField getIndexedHeader(int index) throws Http2Exception {
         if (index <= HpackStaticTable.length) {
             return HpackStaticTable.getEntry(index);
@@ -437,6 +319,25 @@ final class HpackDecoder {
             default:
                 throw new Error("should not reach here");
         }
+    }
+
+    private CharSequence readLengthPrefixedString(ByteBuf in) throws Http2Exception {
+        // Read literal header string prefix
+        if (!in.isReadable()) {
+            throw READ_LENGTH_PREFIXED_STRING_INCOMPLETE;
+        }
+        byte b = in.readByte();
+        boolean huffmanEncoded = (b & 0x80) == 0x80;
+        int length = b & 0x7F;
+        if (length == 0x7f) {
+            // Read literal header string length
+            length = decodeULE128(in, length);
+        }
+        // Read literal header string
+        if (length > in.readableBytes()) {
+            throw READ_LENGTH_PREFIXED_STRING_INCOMPLETE;
+        }
+        return readStringLiteral(in, length, huffmanEncoded);
     }
 
     private CharSequence readStringLiteral(ByteBuf in, int length, boolean huffmanEncoded) throws Http2Exception {
