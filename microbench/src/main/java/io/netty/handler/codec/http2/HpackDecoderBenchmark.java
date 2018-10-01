@@ -35,17 +35,25 @@ import io.netty.buffer.ByteBuf;
 import io.netty.microbench.util.AbstractMicrobenchmark;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
+import org.openjdk.jmh.annotations.Fork;
 import org.openjdk.jmh.annotations.Level;
+import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OutputTimeUnit;
 import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.TearDown;
+import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
+import java.util.concurrent.TimeUnit;
 
 import static io.netty.buffer.Unpooled.wrappedBuffer;
 import static io.netty.handler.codec.http2.HpackBenchmarkUtil.http2Headers;
-import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE;
 
+@Fork(1)
+@Warmup(iterations = 5)
+@Measurement(iterations = 5)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
 public class HpackDecoderBenchmark extends AbstractMicrobenchmark {
 
     @Param
@@ -70,15 +78,16 @@ public class HpackDecoderBenchmark extends AbstractMicrobenchmark {
     }
 
     @Benchmark
-    @BenchmarkMode(Mode.Throughput)
+    @BenchmarkMode(Mode.AverageTime)
     public void decode(final Blackhole bh) throws Http2Exception {
-        HpackDecoder hpackDecoder = new HpackDecoder(DEFAULT_HEADER_LIST_SIZE, 32);
+        HpackDecoder hpackDecoder = new HpackDecoder(Integer.MAX_VALUE, 32);
         @SuppressWarnings("unchecked")
         Http2Headers headers =
                 new DefaultHttp2Headers() {
             @Override
             public Http2Headers add(CharSequence name, CharSequence value) {
-                bh.consume(sensitive);
+                bh.consume(name);
+                bh.consume(value);
                 return this;
             }
         };
