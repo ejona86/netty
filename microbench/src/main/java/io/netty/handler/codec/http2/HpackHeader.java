@@ -56,18 +56,17 @@ class HpackHeader {
      * Creates a number of random headers with the given name/value lengths.
      */
     static List<HpackHeader> createHeaders(int numHeaders, int nameLength, int valueLength,
-                                           boolean limitToAscii) {
+                                           boolean limitToAscii, Random random) {
         List<HpackHeader> hpackHeaders = new ArrayList<HpackHeader>(numHeaders);
         for (int i = 0; i < numHeaders; ++i) {
-            byte[] name = randomBytes(new byte[nameLength], limitToAscii);
-            byte[] value = randomBytes(new byte[valueLength], limitToAscii);
+            byte[] name = randomBytes(new byte[nameLength], limitToAscii, random);
+            byte[] value = randomBytes(new byte[valueLength], limitToAscii, random);
             hpackHeaders.add(new HpackHeader(name, value));
         }
         return hpackHeaders;
     }
 
-    private static byte[] randomBytes(byte[] bytes, boolean limitToAscii) {
-        Random r = new Random();
+    private static byte[] randomBytes(byte[] bytes, boolean limitToAscii, Random r) {
         if (limitToAscii) {
             for (int index = 0; index < bytes.length; ++index) {
                 int charIndex = r.nextInt(ALPHABET.length());

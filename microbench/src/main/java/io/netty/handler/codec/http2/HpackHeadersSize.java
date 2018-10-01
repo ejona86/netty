@@ -35,6 +35,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import java.util.List;
+import java.util.Random;
 
 /**
  * Enum that indicates the size of the headers to be used for the benchmark.
@@ -55,7 +56,8 @@ public enum HpackHeadersSize {
     }
 
     public List<HpackHeader> newHeaders(boolean limitAscii) {
-        return HpackHeader.createHeaders(numHeaders, nameLength, valueLength, limitAscii);
+        Random random = new Random(1);
+        return HpackHeader.createHeaders(numHeaders, nameLength, valueLength, limitAscii, random);
     }
 
     public ByteBuf newOutBuffer() {
